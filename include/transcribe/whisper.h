@@ -6,7 +6,8 @@
  *     conditioning, temperature fallback tuple, no-speech gate);
  *   - the family telemetry chunk-trace struct;
  *   - the disabled-threshold sentinel macros (+/-INF) and the prompt
- *     composition enum used by the run ext.
+ *     composition enum used by the run ext;
+ *   - the step API for callers that own the decoding loop.
  *
  * Whisper exposes substantial real model-specific knobs (13 fields).
  * The PNC/ITN toggles that other families share via transcribe_run_params
@@ -209,6 +210,108 @@ TRANSCRIBE_API int transcribe_get_whisper_chunk_count(const struct transcribe_se
 TRANSCRIBE_API transcribe_status transcribe_get_whisper_chunk_trace(const struct transcribe_session *       session,
                                                                     int                                     i,
                                                                     struct transcribe_whisper_chunk_trace * out_trace);
+
+/* ----------------------------------------------------------------------- */
+/* Whisper step API                                                        */
+/* ----------------------------------------------------------------------- */
+
+/*
+ * Low-level encoder and decoder steps for callers that own the decoding loop,
+ * such as streaming policies that read the alignment heads' cross-attention
+ * after every token (SimulStreaming's AlignAtt). The session holds one encoded
+ * window and one decoder cache. transcribe_run does not mix with these calls:
+ * encode again after a run.
+ *
+ * A pass:
+ *
+ *     transcribe_whisper_step_encode(session, pcm, n_samples);
+ *     transcribe_whisper_step_decode(session, prompt, n_prompt, 0, &last, 1);
+ *     transcribe_whisper_step_get_logits(session, 0, logits, n_vocab);
+ *     transcribe_whisper_step_get_cross_attention(session, attn, n_attn);
+ *     for each generated token, with n_past counting the tokens so far:
+ *         transcribe_whisper_step_decode(session, &token, 1, n_past, NULL, 0);
+ *         ... read logits and attention again ...
+ *
+ * Every call follows the threading contract of transcribe_run: sessions of one
+ * model must be serialized against each other.
+ */
+
+/* Model dimensions, named as openai-whisper names them. */
+struct transcribe_whisper_dims {
+    uint64_t struct_size;
+    int32_t  n_mels;
+    int32_t  n_audio_ctx;
+    int32_t  n_audio_state;
+    int32_t  n_audio_head;
+    int32_t  n_audio_layer;
+    int32_t  n_vocab;
+    int32_t  n_text_ctx;
+    int32_t  n_text_state;
+    int32_t  n_text_head;
+    int32_t  n_text_layer;
+};
+
+/*
+ * Returns:
+ *   TRANSCRIBE_ERR_INVALID_ARG      a NULL argument.
+ *   TRANSCRIBE_ERR_BAD_STRUCT_SIZE  out->struct_size is too small.
+ *   TRANSCRIBE_ERR_UNSUPPORTED_ARCH not a Whisper model.
+ */
+TRANSCRIBE_API transcribe_status transcribe_whisper_get_dims(const struct transcribe_model *  model,
+                                                             struct transcribe_whisper_dims * out);
+
+/*
+ * Select the cross-attention heads to read back: n_heads (layer, head) pairs.
+ * Whisper's alignment heads are a per-checkpoint table that GGUF files do not
+ * carry, so the caller supplies them. Copied; the default is none.
+ */
+TRANSCRIBE_API transcribe_status transcribe_whisper_step_set_align_heads(struct transcribe_session * session,
+                                                                         const int32_t *             layer_head_pairs,
+                                                                         int                         n_heads);
+
+/*
+ * Encode one window of 16 kHz mono PCM and restart the decoder cache. Shorter
+ * audio is zero-padded to the window (30 s); only the first window of longer
+ * audio is encoded.
+ */
+TRANSCRIBE_API transcribe_status transcribe_whisper_step_encode(struct transcribe_session * session,
+                                                                const float *               pcm,
+                                                                int                         n_samples);
+
+/*
+ * Run the decoder over tokens at positions [n_past, n_past + n_tokens). n_past
+ * may rewind into the cache, not skip past its end. logit_rows lists the rows
+ * of tokens to emit logits for; n_logit_rows 0 means every row, or the one row
+ * of a single-token step. Listing rows saves both memory and readback on a long
+ * prompt.
+ *
+ * Returns TRANSCRIBE_ERR_INVALID_ARG before a successful encode,
+ * TRANSCRIBE_ERR_INPUT_TOO_LONG past the decoder's context.
+ */
+TRANSCRIBE_API transcribe_status transcribe_whisper_step_decode(struct transcribe_session * session,
+                                                                const int32_t *             tokens,
+                                                                int                         n_tokens,
+                                                                int                         n_past,
+                                                                const int32_t *             logit_rows,
+                                                                int                         n_logit_rows);
+
+/*
+ * Raw (pre-softmax) logits of the last decode. row indexes its logit rows;
+ * out holds n_vocab floats.
+ */
+TRANSCRIBE_API transcribe_status transcribe_whisper_step_get_logits(const struct transcribe_session * session,
+                                                                    int                               row,
+                                                                    float *                           out,
+                                                                    size_t                            n_out);
+
+/*
+ * Cross-attention weights of the selected heads for the last decode, softmaxed
+ * over the encoder frames. out holds n_heads * n_tokens * n_audio_ctx floats:
+ * out[(h * n_tokens + t) * n_audio_ctx + f] is head h, decoded token t, frame f.
+ */
+TRANSCRIBE_API transcribe_status transcribe_whisper_step_get_cross_attention(const struct transcribe_session * session,
+                                                                             float *                           out,
+                                                                             size_t                            n_out);
 
 #ifdef __cplusplus
 } /* extern "C" */

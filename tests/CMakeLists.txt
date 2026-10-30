@@ -1271,6 +1271,22 @@ if(TRANSCRIBE_BUILD_REAL_MODEL_TESTS)
     set_tests_properties(transcribe_whisper_e2e_smoke PROPERTIES
         SKIP_RETURN_CODE 77)
 
+    add_executable(transcribe_whisper_step_smoke
+        whisper_step_smoke.cpp)
+
+    target_link_libraries(transcribe_whisper_step_smoke
+        PRIVATE transcribe transcribe-common-example)
+
+    target_compile_definitions(transcribe_whisper_step_smoke PRIVATE
+        "TRANSCRIBE_TEST_SAMPLES_DIR=\"${CMAKE_SOURCE_DIR}/samples\"")
+
+    transcribe_apply_warnings(transcribe_whisper_step_smoke)
+
+    add_test(NAME transcribe_whisper_step_smoke
+        COMMAND transcribe_whisper_step_smoke)
+    set_tests_properties(transcribe_whisper_step_smoke PROPERTIES
+        SKIP_RETURN_CODE 77)
+
     # Legacy whisper.cpp `.bin` end-to-end smoke. Gated by
     # TRANSCRIBE_WHISPER_BIN_TINY_Q8_0 so CI without an upstream
     # `.bin` skips cleanly (RC 77). Same gating pattern as the

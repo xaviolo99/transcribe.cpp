@@ -31,6 +31,21 @@ struct WhisperHParams;
 struct WhisperWeights;
 struct WhisperKvCache;
 
+// One cross-attention head of one decoder layer.
+struct WhisperAlignHead {
+    int32_t layer = 0;
+    int32_t head  = 0;
+};
+
+// Optional side output of the cross-attention blocks: the attention weights of
+// the listed heads, computed next to the flash-attention path (which never
+// materializes them). weights[i] is F32 [T_enc, n_tokens], softmaxed over the
+// real encoder frames only (no cross-pad slots).
+struct CrossAttnCapture {
+    const std::vector<WhisperAlignHead> * heads = nullptr;
+    std::vector<ggml_tensor *>            weights;
+};
+
 struct DecoderDumps {
     ggml_tensor *              token_emb = nullptr;
     ggml_tensor *              pos_emb   = nullptr;
@@ -53,6 +68,10 @@ struct DecoderBuild {
     // T_enc) and -inf for k in [T_enc, T_enc_pad), so the unmasked
     // padded slots do not contribute to the cross-attn output.
     ggml_tensor * cross_mask_in = nullptr;
+
+    // Rows of the prompt to emit logits for, i32 [n_logit_rows]. Only present
+    // when the caller asked for a subset (see build_decoder_graph_kv).
+    ggml_tensor * logit_rows_in = nullptr;
 
     // Output: log-softmax logits [vocab_size, seq_len].
     ggml_tensor * out = nullptr;
@@ -102,6 +121,11 @@ DecoderBuild build_cross_kv_graph(ggml_context *         compute_ctx,
 // effective n_kv is rounded up to a multiple of kv_pad, and the
 // caller-supplied causal_mask_in covers the trailing padded slots
 // with -inf so they do not contribute to the FA output.
+//
+// n_logit_rows > 0 emits logits for that many rows only, selected at runtime
+// through logit_rows_in, so a long prompt does not pay for a [vocab, n_tokens]
+// tensor it reads two rows of. capture, when set, adds the attention side
+// output; the graph expands it.
 DecoderBuild build_decoder_graph_kv(ggml_context *         compute_ctx,
                                     const WhisperWeights & weights,
                                     const WhisperHParams & hp,
@@ -111,7 +135,9 @@ DecoderBuild build_decoder_graph_kv(ggml_context *         compute_ctx,
                                     int                    T_enc,
                                     int                    kv_pad           = 1,
                                     bool                   skip_log_softmax = false,
-                                    bool                   use_flash        = true);
+                                    bool                   use_flash        = true,
+                                    int                    n_logit_rows     = 0,
+                                    CrossAttnCapture *     capture          = nullptr);
 
 // Static-topology single-token decoder graph. Built once per tier
 // after the prompt pass and reused for every step in the tier's
@@ -144,7 +170,8 @@ StepBuild build_step_graph(ggml_context *         compute_ctx,
                            WhisperKvCache &       kv_cache,
                            int                    max_n_kv,
                            int                    T_enc,
-                           bool                   use_flash = true);
+                           bool                   use_flash = true,
+                           CrossAttnCapture *     capture   = nullptr);
 
 // Offline batched decode (B utterances in lockstep). Mirrors the single-shot
 // cross-KV + step graphs but threads the batch on the trailing flash axis

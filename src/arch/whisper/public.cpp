@@ -6,6 +6,7 @@
 // include/transcribe/whisper.h.
 
 #include "transcribe-abi.h"    // check_struct_size, copy_out_prefix
+#include "transcribe-api-guard.h"
 #include "transcribe-arch.h"   // Arch (session->model->arch)
 #include "transcribe-model.h"  // transcribe_model (session->model)
 #include "whisper.h"           // WhisperSession (+ transcribe/whisper.h, transcribe-session.h)
@@ -42,6 +43,11 @@ const transcribe::whisper::WhisperSession * maybe_whisper_context(const struct t
         return nullptr;
     }
     return static_cast<const transcribe::whisper::WhisperSession *>(session);
+}
+
+transcribe::whisper::WhisperSession * maybe_whisper_context(struct transcribe_session * session) {
+    return const_cast<transcribe::whisper::WhisperSession *>(
+        maybe_whisper_context(static_cast<const struct transcribe_session *>(session)));
 }
 
 }  // namespace
@@ -108,4 +114,83 @@ extern "C" transcribe_status transcribe_get_whisper_chunk_trace(const struct tra
     staged.struct_size                    = caller_size;
     copy_out_prefix(out_trace, &staged, caller_size, sizeof(staged));
     return TRANSCRIBE_OK;
+}
+
+// Step API.
+extern "C" transcribe_status transcribe_whisper_get_dims(const struct transcribe_model *  model,
+                                                         struct transcribe_whisper_dims * out) {
+    if (model == nullptr || out == nullptr) {
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    if (const auto st = check_struct_size(out->struct_size, sizeof(*out)); st != TRANSCRIBE_OK) {
+        return st;
+    }
+    if (model->arch == nullptr || model->arch->name == nullptr || std::strcmp(model->arch->name, "whisper") != 0) {
+        return TRANSCRIBE_ERR_UNSUPPORTED_ARCH;
+    }
+    const auto & hp    = static_cast<const transcribe::whisper::WhisperModel *>(model)->hparams;
+    out->n_mels        = hp.enc_num_mel_bins;
+    out->n_audio_ctx   = hp.enc_max_source_positions;
+    out->n_audio_state = hp.enc_d_model;
+    out->n_audio_head  = hp.enc_n_heads;
+    out->n_audio_layer = hp.enc_n_layers;
+    out->n_vocab       = hp.dec_vocab_size;
+    out->n_text_ctx    = hp.dec_max_target_positions;
+    out->n_text_state  = hp.dec_d_model;
+    out->n_text_head   = hp.dec_n_heads;
+    out->n_text_layer  = hp.dec_n_layers;
+    return TRANSCRIBE_OK;
+}
+
+extern "C" transcribe_status transcribe_whisper_step_set_align_heads(struct transcribe_session * session,
+                                                                     const int32_t *             layer_head_pairs,
+                                                                     int                         n_heads) {
+    return transcribe::api_guard_status("transcribe_whisper_step_set_align_heads", [&]() -> transcribe_status {
+        auto * wc = maybe_whisper_context(session);
+        return wc == nullptr ? TRANSCRIBE_ERR_UNSUPPORTED_ARCH :
+                               transcribe::whisper::step_set_align_heads(wc, layer_head_pairs, n_heads);
+    });
+}
+
+extern "C" transcribe_status transcribe_whisper_step_encode(struct transcribe_session * session,
+                                                            const float *               pcm,
+                                                            int                         n_samples) {
+    return transcribe::api_guard_status("transcribe_whisper_step_encode", [&]() -> transcribe_status {
+        auto * wc = maybe_whisper_context(session);
+        return wc == nullptr ? TRANSCRIBE_ERR_UNSUPPORTED_ARCH : transcribe::whisper::step_encode(wc, pcm, n_samples);
+    });
+}
+
+extern "C" transcribe_status transcribe_whisper_step_decode(struct transcribe_session * session,
+                                                            const int32_t *             tokens,
+                                                            int                         n_tokens,
+                                                            int                         n_past,
+                                                            const int32_t *             logit_rows,
+                                                            int                         n_logit_rows) {
+    return transcribe::api_guard_status("transcribe_whisper_step_decode", [&]() -> transcribe_status {
+        auto * wc = maybe_whisper_context(session);
+        return wc == nullptr ? TRANSCRIBE_ERR_UNSUPPORTED_ARCH :
+                               transcribe::whisper::step_decode(wc, tokens, n_tokens, n_past, logit_rows, n_logit_rows);
+    });
+}
+
+extern "C" transcribe_status transcribe_whisper_step_get_logits(const struct transcribe_session * session,
+                                                                int                               row,
+                                                                float *                           out,
+                                                                size_t                            n_out) {
+    return transcribe::api_guard_status("transcribe_whisper_step_get_logits", [&]() -> transcribe_status {
+        const auto * wc = maybe_whisper_context(session);
+        return wc == nullptr ? TRANSCRIBE_ERR_UNSUPPORTED_ARCH :
+                               transcribe::whisper::step_get_logits(wc, row, out, n_out);
+    });
+}
+
+extern "C" transcribe_status transcribe_whisper_step_get_cross_attention(const struct transcribe_session * session,
+                                                                         float *                           out,
+                                                                         size_t                            n_out) {
+    return transcribe::api_guard_status("transcribe_whisper_step_get_cross_attention", [&]() -> transcribe_status {
+        const auto * wc = maybe_whisper_context(session);
+        return wc == nullptr ? TRANSCRIBE_ERR_UNSUPPORTED_ARCH :
+                               transcribe::whisper::step_get_cross_attention(wc, out, n_out);
+    });
 }

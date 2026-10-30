@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "decoder.h"
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "transcribe-backend.h"
@@ -289,6 +290,45 @@ struct WhisperModel final : public transcribe_model {
     const transcribe::Tokenizer * tokenizer() const override { return &tok; }
 };
 
+struct WhisperSession;
+
+// Defined in model.cpp, shared with whisper_run (see step.cpp).
+bool              step_ensure_compute_ctx(WhisperSession * cc, size_t mem);
+transcribe_status step_run_encoder(WhisperSession * cc,
+                                   WhisperModel *   cm,
+                                   const float *    mel_data,
+                                   int              n_mels,
+                                   int              n_mel_frames,
+                                   int &            out_T_enc);
+
+// Step API state (see transcribe_whisper_step_* and step.cpp). The graph
+// pointers live in the session's compute_ctx and die at its next reset.
+struct WhisperStepState {
+    std::vector<WhisperAlignHead> align_heads;
+    CrossAttnCapture              capture;
+
+    bool encoded = false;
+
+    // Most recent decode: its outputs and shape.
+    ggml_tensor * logits       = nullptr;
+    int           n_logit_rows = 0;
+    int           n_attn_rows  = 0;
+
+    // Single-token graph reused across a pass's steps. Valid iff step.graph
+    // is set; any other graph on the session clears it.
+    StepBuild                step{};
+    std::vector<ggml_fp16_t> step_mask;
+    int                      step_mask_n = -1;  // positions open in step_mask
+
+    void invalidate_graphs() {
+        logits       = nullptr;
+        n_logit_rows = 0;
+        n_attn_rows  = 0;
+        step         = StepBuild{};
+        capture.weights.clear();
+    }
+};
+
 struct WhisperSession final : public transcribe_session {
     // Currently-allocated capacity of compute_ctx (mem_size). Used by
     // ensure_compute_ctx to decide between ggml_reset (cheap reuse)
@@ -327,9 +367,22 @@ struct WhisperSession final : public transcribe_session {
     // first use to avoid a per-call double[vocab] allocation in the hot path.
     std::vector<double> sample_scratch;
 
+    WhisperStepState step_api;
+
     WhisperSession() = default;
     ~WhisperSession() override;
     void on_scratch_released() noexcept override;
 };
+
+transcribe_status step_set_align_heads(WhisperSession * cc, const int32_t * layer_head_pairs, int n_heads);
+transcribe_status step_encode(WhisperSession * cc, const float * pcm, int n_samples);
+transcribe_status step_decode(WhisperSession * cc,
+                              const int32_t *  tokens,
+                              int              n_tokens,
+                              int              n_past,
+                              const int32_t *  logit_rows,
+                              int              n_logit_rows);
+transcribe_status step_get_logits(const WhisperSession * cc, int row, float * out, size_t n_out);
+transcribe_status step_get_cross_attention(const WhisperSession * cc, float * out, size_t n_out);
 
 }  // namespace transcribe::whisper

@@ -99,6 +99,7 @@ add_library(transcribe
     arch/whisper/decoder.cpp
     arch/whisper/bin_load.cpp
     arch/whisper/public.cpp
+    arch/whisper/step.cpp
     arch/moonshine/model.cpp
     arch/moonshine/capabilities.cpp
     arch/moonshine/weights.cpp

@@ -11,7 +11,7 @@
 // Stable digest of the ABI surface (structs, enums, macros, layout,
 // prototypes), computed by the Python oracle and pinned here so a header
 // ABI change turns this binding's drift check red for conscious review.
-export const PUBLIC_HEADER_HASH = "f99ad4169374b8f3";
+export const PUBLIC_HEADER_HASH = "e84e24083f49467a";
 
 // === enum constants ===
 export const TRANSCRIBE_OK = 0;
@@ -187,6 +187,7 @@ export const STRUCT_LAYOUT: Record<string, StructLayout> = {
   'transcribe_voxtral_realtime_stream_ext': { size: 24, align: 8, offsets: {'ext': 0, 'num_delay_tokens': 16, 'min_decode_interval_ms': 20} },
   'transcribe_whisper_run_ext': { size: 80, align: 8, offsets: {'ext': 0, 'initial_prompt': 16, 'prompt_tokens': 24, 'n_prompt_tokens': 32, 'prompt_condition': 40, 'condition_on_prev_tokens': 44, 'max_prev_context_tokens': 48, 'temperature': 52, 'temperature_inc': 56, 'compression_ratio_thold': 60, 'logprob_thold': 64, 'no_speech_thold': 68, 'seed': 72, 'max_initial_timestamp': 76} },
   'transcribe_whisper_chunk_trace': { size: 48, align: 8, offsets: {'struct_size': 0, 't0_ms': 8, 't1_ms': 16, 'temperature_used': 24, 'compression_ratio': 28, 'avg_logprob': 32, 'no_speech_prob': 36, 'no_speech_triggered': 40, 'n_fallbacks': 44} },
+  'transcribe_whisper_dims': { size: 48, align: 8, offsets: {'struct_size': 0, 'n_mels': 8, 'n_audio_ctx': 12, 'n_audio_state': 16, 'n_audio_head': 20, 'n_audio_layer': 24, 'n_vocab': 28, 'n_text_ctx': 32, 'n_text_state': 36, 'n_text_head': 40, 'n_text_layer': 44} },
 };
 
 export const ABI_STRUCT_IDS: Record<string, number> = {
@@ -260,6 +261,7 @@ export function defineTypes(koffi: any): Record<string, any> {
   T['transcribe_voxtral_realtime_stream_ext'] = koffi.struct({ ext: T['transcribe_ext'], num_delay_tokens: 'int32_t', min_decode_interval_ms: 'int32_t' });
   T['transcribe_whisper_run_ext'] = koffi.struct({ ext: T['transcribe_ext'], initial_prompt: 'char *', prompt_tokens: 'void *', n_prompt_tokens: 'size_t', prompt_condition: 'int', condition_on_prev_tokens: 'bool', max_prev_context_tokens: 'int32_t', temperature: 'float', temperature_inc: 'float', compression_ratio_thold: 'float', logprob_thold: 'float', no_speech_thold: 'float', seed: 'uint32_t', max_initial_timestamp: 'float' });
   T['transcribe_whisper_chunk_trace'] = koffi.struct({ struct_size: 'uint64_t', t0_ms: 'int64_t', t1_ms: 'int64_t', temperature_used: 'float', compression_ratio: 'float', avg_logprob: 'float', no_speech_prob: 'float', no_speech_triggered: 'bool', n_fallbacks: 'int32_t' });
+  T['transcribe_whisper_dims'] = koffi.struct({ struct_size: 'uint64_t', n_mels: 'int32_t', n_audio_ctx: 'int32_t', n_audio_state: 'int32_t', n_audio_head: 'int32_t', n_audio_layer: 'int32_t', n_vocab: 'int32_t', n_text_ctx: 'int32_t', n_text_state: 'int32_t', n_text_head: 'int32_t', n_text_layer: 'int32_t' });
   return T;
 }
 
@@ -410,6 +412,12 @@ export const FUNCTION_SIGNATURES: Record<string, FnSig> = {
   'transcribe_was_aborted': { ret: '_Bool', args: ['const struct transcribe_session *'] },
   'transcribe_was_truncated': { ret: '_Bool', args: ['const struct transcribe_session *'] },
   'transcribe_whisper_chunk_trace_init': { ret: 'void', args: ['struct transcribe_whisper_chunk_trace *'] },
+  'transcribe_whisper_get_dims': { ret: 'transcribe_status', args: ['const struct transcribe_model *', 'struct transcribe_whisper_dims *'] },
   'transcribe_whisper_run_ext_init': { ret: 'void', args: ['struct transcribe_whisper_run_ext *'] },
+  'transcribe_whisper_step_decode': { ret: 'transcribe_status', args: ['struct transcribe_session *', 'const int32_t *', 'int', 'int', 'const int32_t *', 'int'] },
+  'transcribe_whisper_step_encode': { ret: 'transcribe_status', args: ['struct transcribe_session *', 'const float *', 'int'] },
+  'transcribe_whisper_step_get_cross_attention': { ret: 'transcribe_status', args: ['const struct transcribe_session *', 'float *', 'size_t'] },
+  'transcribe_whisper_step_get_logits': { ret: 'transcribe_status', args: ['const struct transcribe_session *', 'int', 'float *', 'size_t'] },
+  'transcribe_whisper_step_set_align_heads': { ret: 'transcribe_status', args: ['struct transcribe_session *', 'const int32_t *', 'int'] },
   'transcribe_word_init': { ret: 'void', args: ['struct transcribe_word *'] },
 };

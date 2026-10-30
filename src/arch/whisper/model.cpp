@@ -75,6 +75,8 @@ WhisperSession::~WhisperSession() {
 // Base release_scratch has freed sched/compute_ctx; drop what pointed into them.
 void WhisperSession::on_scratch_released() noexcept {
     compute_ctx_size = 0;
+    step_api.invalidate_graphs();
+    step_api.encoded = false;
 }
 
 bool enc_out_init(WhisperEncOut & enc_out, ggml_backend_t backend, int d_model, int T_enc) {
@@ -3572,5 +3574,19 @@ extern const Arch arch = {
     /* .accepts_ext_kind = */ whisper_accepts_ext_kind,
     /* .run_validate     = */ whisper_run_validate,
 };
+
+// The step API (step.cpp) shares these with whisper_run.
+bool step_ensure_compute_ctx(WhisperSession * cc, size_t mem) {
+    return ensure_compute_ctx(cc, mem);
+}
+
+transcribe_status step_run_encoder(WhisperSession * cc,
+                                   WhisperModel *   cm,
+                                   const float *    mel_data,
+                                   int              n_mels,
+                                   int              n_mel_frames,
+                                   int &            out_T_enc) {
+    return run_whisper_encoder_on_window(cc, cm, mel_data, n_mels, n_mel_frames, /*allow_dumps=*/false, out_T_enc);
+}
 
 }  // namespace transcribe::whisper

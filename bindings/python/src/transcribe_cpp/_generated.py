@@ -13,7 +13,7 @@ import ctypes as _c
 # Stable digest of the ABI surface below (structs, enums, macros, layout,
 # prototypes). A native provider package echoes this back so the API
 # package can reject an ABI-mismatched provider before dlopen.
-PUBLIC_HEADER_HASH = "f99ad4169374b8f3"
+PUBLIC_HEADER_HASH = "e84e24083f49467a"
 
 # === enum constants ===
 TRANSCRIBE_OK = 0
@@ -224,6 +224,8 @@ class transcribe_whisper_run_ext(_c.Structure):
     pass
 class transcribe_whisper_chunk_trace(_c.Structure):
     pass
+class transcribe_whisper_dims(_c.Structure):
+    pass
 
 transcribe_ext._fields_ = [("size", _c.c_uint64), ("kind", _c.c_uint32)]
 transcribe_backend_init_params._fields_ = [("struct_size", _c.c_uint64), ("artifact_dir", _c.c_char_p), ("allowed_backends", _c.c_uint32)]
@@ -261,6 +263,7 @@ transcribe_vad_segment._fields_ = [("struct_size", _c.c_uint64), ("start_sample"
 transcribe_voxtral_realtime_stream_ext._fields_ = [("ext", transcribe_ext), ("num_delay_tokens", _c.c_int32), ("min_decode_interval_ms", _c.c_int32)]
 transcribe_whisper_run_ext._fields_ = [("ext", transcribe_ext), ("initial_prompt", _c.c_char_p), ("prompt_tokens", _c.POINTER(_c.c_int32)), ("n_prompt_tokens", _c.c_size_t), ("prompt_condition", _c.c_int), ("condition_on_prev_tokens", _c.c_bool), ("max_prev_context_tokens", _c.c_int32), ("temperature", _c.c_float), ("temperature_inc", _c.c_float), ("compression_ratio_thold", _c.c_float), ("logprob_thold", _c.c_float), ("no_speech_thold", _c.c_float), ("seed", _c.c_uint32), ("max_initial_timestamp", _c.c_float)]
 transcribe_whisper_chunk_trace._fields_ = [("struct_size", _c.c_uint64), ("t0_ms", _c.c_int64), ("t1_ms", _c.c_int64), ("temperature_used", _c.c_float), ("compression_ratio", _c.c_float), ("avg_logprob", _c.c_float), ("no_speech_prob", _c.c_float), ("no_speech_triggered", _c.c_bool), ("n_fallbacks", _c.c_int32)]
+transcribe_whisper_dims._fields_ = [("struct_size", _c.c_uint64), ("n_mels", _c.c_int32), ("n_audio_ctx", _c.c_int32), ("n_audio_state", _c.c_int32), ("n_audio_head", _c.c_int32), ("n_audio_layer", _c.c_int32), ("n_vocab", _c.c_int32), ("n_text_ctx", _c.c_int32), ("n_text_state", _c.c_int32), ("n_text_head", _c.c_int32), ("n_text_layer", _c.c_int32)]
 
 # === ABI metadata ===
 # transcribe_abi_struct id per struct (for the native size/align check).
@@ -334,6 +337,7 @@ STRUCT_LAYOUT = {
     'transcribe_voxtral_realtime_stream_ext': {'size': 24, 'align': 8, 'offsets': {'ext': 0, 'num_delay_tokens': 16, 'min_decode_interval_ms': 20}},
     'transcribe_whisper_run_ext': {'size': 80, 'align': 8, 'offsets': {'ext': 0, 'initial_prompt': 16, 'prompt_tokens': 24, 'n_prompt_tokens': 32, 'prompt_condition': 40, 'condition_on_prev_tokens': 44, 'max_prev_context_tokens': 48, 'temperature': 52, 'temperature_inc': 56, 'compression_ratio_thold': 60, 'logprob_thold': 64, 'no_speech_thold': 68, 'seed': 72, 'max_initial_timestamp': 76}},
     'transcribe_whisper_chunk_trace': {'size': 48, 'align': 8, 'offsets': {'struct_size': 0, 't0_ms': 8, 't1_ms': 16, 'temperature_used': 24, 'compression_ratio': 28, 'avg_logprob': 32, 'no_speech_prob': 36, 'no_speech_triggered': 40, 'n_fallbacks': 44}},
+    'transcribe_whisper_dims': {'size': 48, 'align': 8, 'offsets': {'struct_size': 0, 'n_mels': 8, 'n_audio_ctx': 12, 'n_audio_state': 16, 'n_audio_head': 20, 'n_audio_layer': 24, 'n_vocab': 28, 'n_text_ctx': 32, 'n_text_state': 36, 'n_text_head': 40, 'n_text_layer': 44}},
 }
 
 # === function prototypes ===
@@ -629,7 +633,19 @@ def configure(lib):
     lib.transcribe_was_truncated.argtypes = [_c.c_void_p]
     lib.transcribe_whisper_chunk_trace_init.restype = None
     lib.transcribe_whisper_chunk_trace_init.argtypes = [_c.POINTER(transcribe_whisper_chunk_trace)]
+    lib.transcribe_whisper_get_dims.restype = _c.c_int
+    lib.transcribe_whisper_get_dims.argtypes = [_c.c_void_p, _c.POINTER(transcribe_whisper_dims)]
     lib.transcribe_whisper_run_ext_init.restype = None
     lib.transcribe_whisper_run_ext_init.argtypes = [_c.POINTER(transcribe_whisper_run_ext)]
+    lib.transcribe_whisper_step_decode.restype = _c.c_int
+    lib.transcribe_whisper_step_decode.argtypes = [_c.c_void_p, _c.POINTER(_c.c_int32), _c.c_int, _c.c_int, _c.POINTER(_c.c_int32), _c.c_int]
+    lib.transcribe_whisper_step_encode.restype = _c.c_int
+    lib.transcribe_whisper_step_encode.argtypes = [_c.c_void_p, _c.POINTER(_c.c_float), _c.c_int]
+    lib.transcribe_whisper_step_get_cross_attention.restype = _c.c_int
+    lib.transcribe_whisper_step_get_cross_attention.argtypes = [_c.c_void_p, _c.POINTER(_c.c_float), _c.c_size_t]
+    lib.transcribe_whisper_step_get_logits.restype = _c.c_int
+    lib.transcribe_whisper_step_get_logits.argtypes = [_c.c_void_p, _c.c_int, _c.POINTER(_c.c_float), _c.c_size_t]
+    lib.transcribe_whisper_step_set_align_heads.restype = _c.c_int
+    lib.transcribe_whisper_step_set_align_heads.argtypes = [_c.c_void_p, _c.POINTER(_c.c_int32), _c.c_int]
     lib.transcribe_word_init.restype = None
     lib.transcribe_word_init.argtypes = [_c.POINTER(transcribe_word)]
