@@ -41,7 +41,9 @@ jobs:
 
   cu12-wheel-windows:
     needs: api-wheel
-    runs-on: windows-2025
+    # windows-2025 now means Visual Studio 2026, and CUDA 12.8's nvcc refuses anything
+    # past 2022.
+    runs-on: windows-2022
     timeout-minutes: 350
     env:
       CMAKE_GENERATOR: Ninja
