@@ -28,13 +28,10 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
-# The pure-Python API package hard-depends on the default native provider so
-# `pip install transcribe-cpp` transcribes out of the box. The `==X.Y.Z.*` pin
-# is the pre-1.0 base-version contract enforced at the resolver level (a .postN
-# packaging fix still resolves); the import-time version/header-hash check in
-# _library.py is the runtime backstop. check_version_sync.py gates this pin
-# against include/transcribe.h.
-dependencies = ["transcribe-cpp-native==0.4.1.*"]
+# This fork: no dependency on the default native provider. PyPI's has no step
+# API, and this fork's releases carry transcribe-cpp-native-cu12 next to this wheel. The import-time version/header-hash check in _library.py
+# still gates the pair.
+dependencies = []
 
 [project.optional-dependencies]
 # Opt-in accelerator providers — ADDITIVE: they install alongside the default

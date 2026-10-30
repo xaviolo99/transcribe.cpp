@@ -1,0 +1,161 @@
+name: step-api-release
+
+# Fork-only, never upstream: builds the step API's wheels and publishes them on a
+# GitHub release named for the tag, for an app to pin by URL and hash.
+#
+# Upstream's workflows trigger on main and v* tags, so none of them run for a
+# step-api-* tag or a push to the step-api branch. This one needs no secrets and only
+# GitHub-hosted runners. The CUDA build is the slow part: nvcc over ggml-cuda once
+# per architecture.
+#
+# The toolkit stays on the minor the runtime wheels resolve to next to torch's cu128
+# (which pins nvidia-cuda-runtime-cu12 12.8): a module built on a newer
+# minor could import a symbol that runtime lacks, and on Windows that fails
+# quietly and drops the app to Vulkan. CUDA 12.8 is the first with Blackwell (sm_120).
+
+on:
+  push:
+    tags: ["step-api-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: "1"  # hf and uv print non-ASCII; Windows cp1252 console chokes
+  UV_VERSION: "0.12.19"
+
+jobs:
+  api-wheel:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - run: uv build --wheel bindings/python --out-dir dist-api
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-api
+          path: dist-api/*.whl
+
+  cu12-wheel-windows:
+    needs: api-wheel
+    runs-on: windows-2025
+    timeout-minutes: 350
+    env:
+      CMAKE_GENERATOR: Ninja
+      # LunarG prunes old SDK downloads; when bumping, verify the URL exists.
+      VULKAN_VERSION: "1.4.350.0"
+    steps:
+      - uses: actions/checkout@v6
+      # vcvars for the whole job: nvcc needs cl.exe, and the Ninja generator
+      # needs the MSVC environment.
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Install Vulkan SDK ${{ env.VULKAN_VERSION }} (glslc for the ggml-vulkan module)
+        run: |
+          curl.exe -o "$env:RUNNER_TEMP\vulkan_sdk.exe" -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkan_sdk.exe"
+          & "$env:RUNNER_TEMP\vulkan_sdk.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+      - name: Install CUDA toolkit 12.8 (network installer, lean subset)
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "12.8.1"
+          method: network
+          use-github-cache: false
+          use-local-cache: false
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Build the raw cu12 wheel
+        run: uv build --wheel bindings/python-native-cu12 --out-dir dist-raw
+      - name: Repair (delvewheel; CUDA runtime, driver and Vulkan loader stay out)
+        run: |
+          uvx delvewheel repair `
+            --exclude cudart64_12.dll `
+            --exclude cublas64_12.dll `
+            --exclude cublasLt64_12.dll `
+            --exclude nvcuda.dll `
+            --exclude vulkan-1.dll `
+            -w wheelhouse (Get-Item dist-raw/*.whl).FullName
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheel-api
+          path: dist-api
+      - name: GPU-less smoke
+        run: |
+          uv venv --python 3.12 smoke-venv
+          uv pip install --python smoke-venv/Scripts/python.exe (Get-Item dist-api/*.whl).FullName (Get-Item wheelhouse/*.whl).FullName
+          smoke-venv/Scripts/python.exe scripts/ci/step_api_wheel_smoke.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-cu12-windows
+          path: wheelhouse/*.whl
+
+  cu12-wheel-linux:
+    needs: api-wheel
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    env:
+      CMAKE_GENERATOR: Ninja
+      # No Vulkan here: Windows is the product, and Linux is development and
+      # library use on NVIDIA cards, where CUDA is the only backend that matters.
+      CMAKE_ARGS: -DTRANSCRIBE_VULKAN=OFF
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install CUDA toolkit 12.8 and the wheel repair tools
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/cuda-keyring.deb" https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i "$RUNNER_TEMP/cuda-keyring.deb"
+          sudo apt-get update
+          sudo apt-get install -y cuda-toolkit-12-8 ninja-build patchelf
+          echo /usr/local/cuda-12.8/bin >> "$GITHUB_PATH"
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Build the raw cu12 wheel
+        run: uv build --wheel bindings/python-native-cu12 --out-dir dist-raw
+      - name: Repair (auditwheel; CUDA runtime and driver stay out)
+        run: |
+          uvx auditwheel repair \
+            --exclude 'libcuda.so.1' \
+            --exclude 'libcudart.so*' \
+            --exclude 'libcublas.so*' \
+            --exclude 'libcublasLt.so*' \
+            -w wheelhouse dist-raw/*.whl
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheel-api
+          path: dist-api
+      - name: GPU-less smoke
+        run: |
+          uv venv --python 3.12 smoke-venv
+          uv pip install --python smoke-venv/bin/python dist-api/*.whl wheelhouse/*.whl
+          smoke-venv/bin/python scripts/ci/step_api_wheel_smoke.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-cu12-linux
+          path: wheelhouse/*.whl
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/step-api-')
+    needs: [api-wheel, cu12-wheel-windows, cu12-wheel-linux]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - name: List what goes out
+        run: sha256sum dist/*.whl
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.whl --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --title "$GITHUB_REF_NAME" --notes "Step API wheels, built from $GITHUB_SHA."

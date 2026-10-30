@@ -83,12 +83,12 @@ install.components = ["wheel"]
 # The full lane posture lives here (no env-selected lanes — this package IS
 # the cuda lane): dynamic backend modules, conservative CPU baseline, the
 # Vulkan module (superset-of-default rationale in the header comment; build
-# image must provide glslc), CUDA fatbins for T4/A100/A10-3090/4090-L4/H100.
+# image must provide glslc), CUDA fatbins for T4/A100/A10-3090/4090-L4/H100/RTX 50.
 cmake.args = [
   "-DTRANSCRIBE_GGML_BACKEND_DL=ON",
   "-DTRANSCRIBE_CUDA=ON",
   "-DTRANSCRIBE_VULKAN=ON",
   # One switch for GGML_NATIVE=OFF + every x86 SIMD tier (CMakeLists.txt).
   "-DTRANSCRIBE_X86_CONSERVATIVE=ON",
-  "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90",
+  "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;120",
 ]
