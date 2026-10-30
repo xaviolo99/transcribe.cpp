@@ -5,6 +5,8 @@
 #include "decoder.h"
 #include "ggml-backend.h"
 #include "ggml.h"
+#include "transcribe-abi.h"
+#include "transcribe-batch-util.h"
 #include "transcribe-debug.h"
 #include "transcribe-log.h"
 #include "weights.h"
@@ -24,6 +26,14 @@ namespace {
 // rebuilt at the decoder's full context when a prompt outgrows it.
 constexpr int k_step_window = 256;
 constexpr int k_step_margin = 64;
+
+// The CPU backend belongs to the model and a sched only sets its thread count when
+// created, which on this long-lived path means once: another session's would stay.
+void apply_session_threads(WhisperSession * cc) {
+    if (cc->sched != nullptr) {
+        transcribe::configure_sched_n_threads(cc->sched, cc->n_threads);
+    }
+}
 
 bool primary_is_gpu(const WhisperModel & cm) {
     return cm.plan.primary_kind != transcribe::BackendKind::Cpu &&
@@ -162,7 +172,6 @@ transcribe_status decode_one(WhisperSession * cc, WhisperModel * cm, int32_t tok
         if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, sb.graph, "whisper")) {
             return TRANSCRIBE_ERR_OOM;
         }
-        set_cross_mask(sb.cross_mask_in, cc->kv_cache.T_enc, 1);
         st.step        = sb;
         st.step_mask_n = -1;
     }
@@ -173,6 +182,10 @@ transcribe_status decode_one(WhisperSession * cc, WhisperModel * cm, int32_t tok
     }
     st.step_mask[static_cast<size_t>(n_past)] = mask_zero;
     st.step_mask_n                            = n_past + 1;
+
+    // Every step: a graph input lives only until its last use in the allocator's
+    // eyes, so if a node of this graph falls back to the CPU it can reuse the memory.
+    set_cross_mask(st.step.cross_mask_in, cc->kv_cache.T_enc, 1);
 
     const int32_t pos    = n_past;
     const int64_t kv_idx = n_past;
@@ -193,20 +206,29 @@ transcribe_status decode_one(WhisperSession * cc, WhisperModel * cm, int32_t tok
 }  // namespace
 
 transcribe_status step_set_align_heads(WhisperSession * cc, const int32_t * layer_head_pairs, int n_heads) {
-    if (n_heads < 0 || (n_heads > 0 && layer_head_pairs == nullptr)) {
+    const auto * cm       = static_cast<const WhisperModel *>(cc->model);
+    const int    n_layers = cm->hparams.dec_n_layers;
+    const int    n_slots  = n_layers * cm->hparams.dec_n_heads;
+    // Duplicates are refused too: each head adds graph nodes, and enough of them
+    // would hit the graph's fixed size, which aborts instead of failing.
+    if (n_heads < 0 || n_heads > n_slots || (n_heads > 0 && layer_head_pairs == nullptr)) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
-    const auto * cm = static_cast<const WhisperModel *>(cc->model);
 
     std::vector<WhisperAlignHead> heads(static_cast<size_t>(n_heads));
+    std::vector<bool>             seen(static_cast<size_t>(n_slots), false);
     for (int i = 0; i < n_heads; ++i) {
         heads[static_cast<size_t>(i)].layer = layer_head_pairs[2 * i];
         heads[static_cast<size_t>(i)].head  = layer_head_pairs[2 * i + 1];
-        if (heads[static_cast<size_t>(i)].layer < 0 ||
-            heads[static_cast<size_t>(i)].layer >= cm->hparams.dec_n_layers || heads[static_cast<size_t>(i)].head < 0 ||
-            heads[static_cast<size_t>(i)].head >= cm->hparams.dec_n_heads) {
+        const WhisperAlignHead & h          = heads[static_cast<size_t>(i)];
+        if (h.layer < 0 || h.layer >= n_layers || h.head < 0 || h.head >= cm->hparams.dec_n_heads) {
             return TRANSCRIBE_ERR_INVALID_ARG;
         }
+        const size_t slot = static_cast<size_t>(h.layer) * cm->hparams.dec_n_heads + static_cast<size_t>(h.head);
+        if (seen[slot]) {
+            return TRANSCRIBE_ERR_INVALID_ARG;
+        }
+        seen[slot] = true;
     }
     WhisperStepState & st = cc->step_api;
     st.invalidate_graphs();
@@ -216,13 +238,17 @@ transcribe_status step_set_align_heads(WhisperSession * cc, const int32_t * laye
 }
 
 transcribe_status step_encode(WhisperSession * cc, const float * pcm, int n_samples) {
-    if (pcm == nullptr || n_samples <= 0) {
+    if (pcm == nullptr || n_samples <= 0 || !transcribe::pcm_is_finite(pcm, n_samples)) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
     auto * cm = static_cast<WhisperModel *>(cc->model);
     if (cm == nullptr || cm->plan.scheduler_list.empty()) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
+    if (cc->poll_abort()) {
+        return TRANSCRIBE_ERR_ABORTED;
+    }
+    apply_session_threads(cc);
     if (!cm->mel.has_value()) {
         return TRANSCRIBE_ERR_GGUF;
     }
@@ -301,7 +327,7 @@ transcribe_status step_decode(WhisperSession * cc,
         n_logit_rows < 0 || (n_logit_rows > 0 && logit_rows == nullptr)) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
-    if (n_past + n_tokens > cc->kv_cache.n_ctx) {
+    if (n_tokens > cc->kv_cache.n_ctx - n_past) {
         return TRANSCRIBE_ERR_INPUT_TOO_LONG;
     }
     for (int i = 0; i < n_tokens; ++i) {
@@ -315,6 +341,11 @@ transcribe_status step_decode(WhisperSession * cc,
         }
     }
 
+    if (cc->poll_abort()) {
+        return TRANSCRIBE_ERR_ABORTED;
+    }
+    apply_session_threads(cc);
+
     // Steady-state steps go through the reusable single-token graph where
     // whisper_run does; prompts rebuild per call since their length varies.
     const bool one_step =
@@ -323,7 +354,11 @@ transcribe_status step_decode(WhisperSession * cc,
                                          decode_one(cc, cm, tokens[0], n_past) :
                                          decode_prompt(cc, cm, tokens, n_tokens, n_past, logit_rows, n_logit_rows);
     if (status != TRANSCRIBE_OK) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "whisper step: decode failed (%d)", static_cast<int>(status));
         st.invalidate_graphs();
+        // Slots from n_past on may be half overwritten: they no longer count.
+        cc->kv_cache.n    = std::min(cc->kv_cache.n, n_past);
+        cc->kv_cache.head = cc->kv_cache.n;
         return status;
     }
     cc->kv_cache.n    = n_past + n_tokens;

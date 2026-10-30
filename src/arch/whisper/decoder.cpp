@@ -392,7 +392,6 @@ ggml_tensor * mha_cross_cached(ggml_context *     ctx,
     // written). FA reads the padded shape — kernel-friendly seq dim at the cost
     // of small dilution unless the caller masks the padded slots.
     const int T_enc_pad = kv_cache.T_enc_pad > 0 ? kv_cache.T_enc_pad : T_enc;
-    (void) T_enc;
 
     // Q from current input; K / V read from the cross cache.
     ggml_tensor * Qcur = ggml_mul_mat(ctx, q_w, x);

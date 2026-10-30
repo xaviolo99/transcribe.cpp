@@ -11,7 +11,7 @@
 // Stable digest of the ABI surface (structs, enums, macros, layout,
 // prototypes), computed by the Python oracle and pinned here so a header
 // ABI change turns this binding's drift check red for conscious review.
-export const PUBLIC_HEADER_HASH = "e84e24083f49467a";
+export const PUBLIC_HEADER_HASH = "3104cfb83aa2d052";
 
 // === enum constants ===
 export const TRANSCRIBE_OK = 0;
@@ -412,6 +412,7 @@ export const FUNCTION_SIGNATURES: Record<string, FnSig> = {
   'transcribe_was_aborted': { ret: '_Bool', args: ['const struct transcribe_session *'] },
   'transcribe_was_truncated': { ret: '_Bool', args: ['const struct transcribe_session *'] },
   'transcribe_whisper_chunk_trace_init': { ret: 'void', args: ['struct transcribe_whisper_chunk_trace *'] },
+  'transcribe_whisper_dims_init': { ret: 'void', args: ['struct transcribe_whisper_dims *'] },
   'transcribe_whisper_get_dims': { ret: 'transcribe_status', args: ['const struct transcribe_model *', 'struct transcribe_whisper_dims *'] },
   'transcribe_whisper_run_ext_init': { ret: 'void', args: ['struct transcribe_whisper_run_ext *'] },
   'transcribe_whisper_step_decode': { ret: 'transcribe_status', args: ['struct transcribe_session *', 'const int32_t *', 'int', 'int', 'const int32_t *', 'int'] },

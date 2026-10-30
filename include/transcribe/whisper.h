@@ -251,6 +251,8 @@ struct transcribe_whisper_dims {
     int32_t  n_text_layer;
 };
 
+TRANSCRIBE_API void transcribe_whisper_dims_init(struct transcribe_whisper_dims * out);
+
 /*
  * Returns:
  *   TRANSCRIBE_ERR_INVALID_ARG      a NULL argument.
@@ -261,9 +263,9 @@ TRANSCRIBE_API transcribe_status transcribe_whisper_get_dims(const struct transc
                                                              struct transcribe_whisper_dims * out);
 
 /*
- * Select the cross-attention heads to read back: n_heads (layer, head) pairs.
- * Whisper's alignment heads are a per-checkpoint table that GGUF files do not
- * carry, so the caller supplies them. Copied; the default is none.
+ * Select the cross-attention heads to read back: n_heads distinct (layer, head)
+ * pairs. Whisper's alignment heads are a per-checkpoint table that GGUF files do
+ * not carry, so the caller supplies them. Copied; the default is none.
  */
 TRANSCRIBE_API transcribe_status transcribe_whisper_step_set_align_heads(struct transcribe_session * session,
                                                                          const int32_t *             layer_head_pairs,
@@ -272,7 +274,8 @@ TRANSCRIBE_API transcribe_status transcribe_whisper_step_set_align_heads(struct 
 /*
  * Encode one window of 16 kHz mono PCM and restart the decoder cache. Shorter
  * audio is zero-padded to the window (30 s); only the first window of longer
- * audio is encoded.
+ * audio is encoded, normalized over all of it as openai's log-mel does. Non-finite
+ * samples return TRANSCRIBE_ERR_INVALID_ARG and leave the previous window in place.
  */
 TRANSCRIBE_API transcribe_status transcribe_whisper_step_encode(struct transcribe_session * session,
                                                                 const float *               pcm,

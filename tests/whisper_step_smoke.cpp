@@ -34,12 +34,10 @@ int g_failures = 0;
         }                                                                        \
     } while (0)
 
-// whisper-base's tables; the test only runs against multilingual checkpoints.
+// The multilingual token table (large-v3's extra language shifts two more below).
 constexpr int32_t k_eot           = 50257;
 constexpr int32_t k_sot           = 50258;
 constexpr int32_t k_lang_en       = 50259;
-constexpr int32_t k_transcribe    = 50359;
-constexpr int32_t k_notimestamps  = 50363;
 constexpr int32_t k_first_special = 50257;
 
 int argmax(const std::vector<float> & v, int n) {
@@ -78,24 +76,40 @@ int main() {
     transcribe_session * session = nullptr;
     CHECK(transcribe_session_init(model, &session_params, &session) == TRANSCRIBE_OK);
 
-    transcribe_whisper_dims dims{};
-    dims.struct_size = sizeof(dims);
+    transcribe_whisper_dims dims;
+    transcribe_whisper_dims_init(&dims);
     CHECK(transcribe_whisper_get_dims(model, &dims) == TRANSCRIBE_OK);
     CHECK(dims.n_audio_ctx == 1500);
-    CHECK(dims.n_vocab > k_notimestamps);
+    if (dims.n_vocab < 51865) {
+        std::fprintf(stderr, "whisper_step_smoke: needs a multilingual model; skipping.\n");
+        transcribe_session_free(session);
+        transcribe_model_free(model);
+        return 77;
+    }
+    const int32_t k_transcribe   = dims.n_vocab >= 51866 ? 50360 : 50359;
+    const int32_t k_notimestamps = dims.n_vocab >= 51866 ? 50364 : 50363;
 
-    // Before an encode there is nothing to decode against.
+    // Before an encode there is nothing to decode against, and no session is an error.
     const int32_t prompt[] = { k_sot, k_lang_en, k_transcribe, k_notimestamps };
+    CHECK(transcribe_whisper_step_decode(nullptr, prompt, 4, 0, nullptr, 0) == TRANSCRIBE_ERR_INVALID_ARG);
     CHECK(transcribe_whisper_step_decode(session, prompt, 4, 0, nullptr, 0) == TRANSCRIBE_ERR_INVALID_ARG);
 
     // Align heads are validated against the model.
     const int32_t bad_heads[] = { dims.n_text_layer, 0 };
     CHECK(transcribe_whisper_step_set_align_heads(session, bad_heads, 1) == TRANSCRIBE_ERR_INVALID_ARG);
+    const int32_t twice[] = { 0, 0, 0, 0 };
+    CHECK(transcribe_whisper_step_set_align_heads(session, twice, 2) == TRANSCRIBE_ERR_INVALID_ARG);
     const int32_t heads[] = { dims.n_text_layer - 1, 0, dims.n_text_layer - 1, 1 };
     const int     n_heads = 2;
     CHECK(transcribe_whisper_step_set_align_heads(session, heads, n_heads) == TRANSCRIBE_OK);
 
     const int n_samples = static_cast<int>(pcm.size());
+    {
+        // One bad sample is refused, not turned into NaN logits for the whole window.
+        std::vector<float> bad = pcm;
+        bad[100]               = std::nanf("");
+        CHECK(transcribe_whisper_step_encode(session, bad.data(), n_samples) == TRANSCRIBE_ERR_INVALID_ARG);
+    }
     CHECK(transcribe_whisper_step_encode(session, pcm.data(), n_samples) == TRANSCRIBE_OK);
 
     const int          n_vocab  = dims.n_vocab;
@@ -124,6 +138,17 @@ int main() {
     // different order.
     CHECK(max_diff < 0.3f);
     CHECK(argmax(logits, n_vocab) == argmax(first_logits, n_vocab));
+
+    // Rewinding and redoing a token gives exactly what it gave the first time, and an
+    // impossible length is an error even where the addition would overflow.
+    {
+        std::vector<float> again(logits.size());
+        CHECK(transcribe_whisper_step_decode(session, prompt + 3, 1, 3, nullptr, 0) == TRANSCRIBE_OK);
+        CHECK(transcribe_whisper_step_get_logits(session, 0, again.data(), again.size()) == TRANSCRIBE_OK);
+        CHECK(again == logits);
+        CHECK(transcribe_whisper_step_decode(session, prompt, INT32_MAX, 4, nullptr, 0) ==
+              TRANSCRIBE_ERR_INPUT_TOO_LONG);
+    }
 
     // Skipping the window's padding in the mel changes nothing.
     {
