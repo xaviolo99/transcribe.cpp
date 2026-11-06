@@ -301,8 +301,8 @@ transcribe_status init_context(transcribe_model *                model,
     cc->model     = model;
     cc->n_threads = params->n_threads;
     cc->kv_type   = params->kv_type;
-    // Captured for base-class uniformity only: this family ignores n_ctx (the
-    // decoder KV ring is constant-memory; the wall is dec_max_position).
+    // Offline runs ignore n_ctx (the wall is dec_max_position). A stream uses it, when
+    // set below the model's sliding window, as its decoder KV ring size (stream_begin).
     cc->n_ctx     = transcribe_session_params_n_ctx(params);
 
     auto * cm = static_cast<Model *>(model);
@@ -1239,20 +1239,82 @@ transcribe_status resolve_stream_ext(const transcribe_stream_params * sp,
     return TRANSCRIBE_OK;
 }
 
-// Install the result snapshot (full_text + single text-only segment) from a
-// forward over `n_avail` accumulated samples. Shared by feed (tentative) and
-// finalize (final).
+// Install the result snapshot from a forward over the accumulated samples, shared
+// by feed (tentative) and finalize (final): the transcript plus word and token rows.
+// Voxtral Realtime emits exactly one token per audio slot (audio_length_per_tok mel
+// hops = 80 ms): a word piece, a [STREAMING_*] control marker or a pad. The first
+// generated token transcribes slot 0 of the stream (the prompt spans the left pad
+// plus `delay` slots), so generated token k covers [k, k + 1) slots of the stream's
+// own audio: word times need no alignment pass. Words split at pieces that start
+// with a space; a word's text is decoded from all its ids at once, so a character
+// split across tokens decodes whole.
 void publish_stream_text(Session * cc, Model * cm, std::string text, int64_t audio_ms) {
+    const HParams & hp = cm->hparams;
+    const int64_t   slot_ms =
+        static_cast<int64_t>(hp.audio_length_per_tok) * hp.fe_hop_length * 1000 / std::max(1, hp.fe_sample_rate);
     cc->full_text   = text;
-    cc->result_kind = TRANSCRIBE_TIMESTAMPS_NONE;
+    cc->result_kind = TRANSCRIBE_TIMESTAMPS_WORD;
     cc->has_result  = true;
+    cc->tokens.clear();
+    cc->words.clear();
     cc->segments.clear();
+
+    std::vector<int32_t> word_ids;
+    int                  word_first_token = 0;
+    auto                 flush_word       = [&] {
+        if (word_ids.empty()) {
+            return;
+        }
+        std::string w = cm->tok.decode(word_ids.data(), static_cast<int>(word_ids.size()));
+        size_t      b = 0, e = w.size();
+        while (b < e && std::isspace(static_cast<unsigned char>(w[b]))) {
+            ++b;
+        }
+        while (e > b && std::isspace(static_cast<unsigned char>(w[e - 1]))) {
+            --e;
+        }
+        transcribe_session::WordEntry we{};
+        we.text        = w.substr(b, e - b);
+        we.first_token = word_first_token;
+        we.n_tokens    = static_cast<int>(word_ids.size());
+        we.t0_ms       = cc->tokens[static_cast<size_t>(word_first_token)].t0_ms;
+        we.t1_ms       = cc->tokens.back().t1_ms;
+        cc->words.push_back(std::move(we));
+        word_ids.clear();
+    };
+    const std::vector<int32_t> & gen = cc->stream_generated;
+    for (size_t k = 0; k < gen.size(); ++k) {
+        const int32_t id = gen[k];
+        if (cm->tok.is_control(id)) {
+            continue;  // pads and word markers carry time, not text
+        }
+        std::string piece = cm->tok.decode(&id, 1);
+        if (!piece.empty() && std::isspace(static_cast<unsigned char>(piece[0]))) {
+            flush_word();
+        }
+        if (word_ids.empty()) {
+            word_first_token = static_cast<int>(cc->tokens.size());
+        }
+        transcribe_session::TokenEntry te{};
+        te.id         = id;
+        te.text       = std::move(piece);
+        te.t0_ms      = static_cast<int64_t>(k) * slot_ms;
+        te.t1_ms      = static_cast<int64_t>(k + 1) * slot_ms;
+        te.word_index = static_cast<int>(cc->words.size());
+        cc->tokens.push_back(std::move(te));
+        word_ids.push_back(id);
+    }
+    flush_word();
+
     transcribe_session::SegmentEntry seg{};
-    seg.text  = std::move(text);
-    seg.t0_ms = 0;
-    seg.t1_ms = audio_ms;
+    seg.text        = std::move(text);
+    seg.t0_ms       = 0;
+    seg.t1_ms       = audio_ms;
+    seg.first_word  = 0;
+    seg.n_words     = static_cast<int>(cc->words.size());
+    seg.first_token = 0;
+    seg.n_tokens    = static_cast<int>(cc->tokens.size());
     cc->segments.push_back(std::move(seg));
-    (void) cm;
 }
 
 transcribe_status stream_validate(const transcribe_session * session,
@@ -1335,25 +1397,44 @@ constexpr int k_enc_max_batch = 512;
 
 // Compact the encoder KV ring: move the last `keep` frames (slots
 // [from_slot-keep, from_slot)) to the front [0, keep), per layer for K and V.
-// Host round-trip (a separate buffer, so correct even when src/dst overlap;
-// infrequent — every ~k_enc_max_batch frames). K/V store RoPE baked at ABSOLUTE
-// positions, so moving the bytes preserves correctness; the caller updates
-// stream_enc_abs_base so the windowed mask stays consistent.
-void compact_enc_ring(Session * cc, Model * cm, int keep, int from_slot) {
-    const int          C        = cc->enc_kv.n_ctx;
-    const size_t       kv_dim   = static_cast<size_t>(cm->hparams.enc_n_heads) * cm->hparams.enc_head_dim;
-    const int          n_layers = cm->hparams.enc_n_layers;
-    const size_t       elem     = ggml_element_size(cc->enc_kv.self_k);
-    std::vector<float> buf(static_cast<size_t>(keep) * kv_dim);
-    ggml_tensor *      tens[2] = { cc->enc_kv.self_k, cc->enc_kv.self_v };
+// Runs on the ring's own backend as one small graph (cont into a scratch node,
+// then cpy into place), so it is correct when src and dst overlap and nothing
+// crosses the host bus (a host round-trip moved n_layers x {K, V} x keep x kv_dim
+// f32 out and back per compaction, ~786 MB on this model every ~k_enc_max_batch
+// frames). K/V store RoPE baked at ABSOLUTE positions, so moving the bytes
+// preserves correctness; the caller updates stream_enc_abs_base so the windowed
+// mask stays consistent.
+transcribe_status compact_enc_ring(Session * cc, Model * cm, int keep, int from_slot) {
+    const int     C        = cc->enc_kv.n_ctx;
+    const size_t  kv_dim   = static_cast<size_t>(cm->hparams.enc_n_heads) * cm->hparams.enc_head_dim;
+    const int     n_layers = cm->hparams.enc_n_layers;
+    const size_t  elem     = ggml_element_size(cc->enc_kv.self_k);
+    ggml_tensor * tens[2]  = { cc->enc_kv.self_k, cc->enc_kv.self_v };
+    if (cc->compute_ctx != nullptr) {
+        ggml_free(cc->compute_ctx);
+        cc->compute_ctx = nullptr;
+    }
+    ggml_init_params ip{};
+    ip.mem_size     = ggml_tensor_overhead() * (8 * static_cast<size_t>(n_layers) + 16) + ggml_graph_overhead();
+    ip.no_alloc     = true;
+    cc->compute_ctx = ggml_init(ip);
+    if (cc->compute_ctx == nullptr) {
+        transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                            "voxtral_realtime: compute context allocation failed — out of memory.");
+        return TRANSCRIBE_ERR_OOM;
+    }
+    ggml_cgraph * gf = ggml_new_graph(cc->compute_ctx);
+    const int64_t n  = static_cast<int64_t>(keep) * static_cast<int64_t>(kv_dim);
     for (int L = 0; L < n_layers; ++L) {
         for (ggml_tensor * t : tens) {
-            const size_t src = (static_cast<size_t>(L) * C + (from_slot - keep)) * kv_dim;
-            const size_t dst = (static_cast<size_t>(L) * C) * kv_dim;
-            ggml_backend_tensor_get(t, buf.data(), elem * src, buf.size() * elem);
-            ggml_backend_tensor_set(t, buf.data(), elem * dst, buf.size() * elem);
+            const size_t  src = (static_cast<size_t>(L) * C + (from_slot - keep)) * kv_dim;
+            const size_t  dst = (static_cast<size_t>(L) * C) * kv_dim;
+            ggml_tensor * vs  = ggml_view_1d(cc->compute_ctx, t, n, elem * src);
+            ggml_tensor * vd  = ggml_view_1d(cc->compute_ctx, t, n, elem * dst);
+            ggml_build_forward_expand(gf, ggml_cpy(cc->compute_ctx, ggml_cont(cc->compute_ctx, vs), vd));
         }
     }
+    return stream_run_graph(cc, cm, gf, [] {});
 }
 
 // The incremental streaming driver. Recomputes the cheap mel + conv stem over
@@ -1542,7 +1623,10 @@ transcribe_status stream_process(Session * cc, Model * cm, bool is_final, bool *
             // Compact the ring so this batch fits (keeps the last W frames).
             if (cc->stream_enc_slot + batch > C) {
                 const int keep = std::min(cc->stream_enc_slot, W);
-                compact_enc_ring(cc, cm, keep, cc->stream_enc_slot);
+                if (const transcribe_status st = compact_enc_ring(cc, cm, keep, cc->stream_enc_slot);
+                    st != TRANSCRIBE_OK) {
+                    return st;
+                }
                 cc->stream_enc_abs_base += cc->stream_enc_slot - keep;
                 cc->stream_enc_slot = keep;
             }
@@ -1746,8 +1830,10 @@ transcribe_status stream_process(Session * cc, Model * cm, bool is_final, bool *
         }
         apply_threads(cc->sched, cc->n_threads);
 
-        const int                swin    = hp.dec_sliding_window;  // 8192
-        const int                kv_ring = max_n_kv;               // ring size == n_ctx (== swin here)
+        const int                kv_ring = max_n_kv;  // ring size == kv_cache.n_ctx
+        // The trained window (8192), or the ring when a session n_ctx made it smaller:
+        // a slot is only revealed while it still holds its own token.
+        const int                swin    = std::min(hp.dec_sliding_window, kv_ring);
         // Hard absolute-position cap = dec_max_position; a streaming caller hits
         // memory/latency long before it (~2.9 h).
         const int                max_pos = voxtral_realtime_abs_position_cap(hp);
@@ -1937,10 +2023,13 @@ transcribe_status stream_begin(transcribe_session * session,
     // Decoder KV: a sliding-window RING sized to the model's own `sliding_window`
     // (from the GGUF, 8192 here). The step loop writes token `cur` at slot
     // `cur % n_ctx`, so the cache holds the last `swin` tokens for any stream
-    // length in constant memory. `sliding_window` is a trained-in constant, not
-    // an inference knob. Sized once per session; never shrinks a larger ctx a
+    // length in constant memory. A session n_ctx below the window sizes the ring
+    // instead (callers that restart streams often: a 2048-slot ring is 164 s and
+    // ~650 MB smaller); a stream longer than the ring then attends to the last
+    // n_ctx tokens only. Sized once per session; never shrinks a larger ctx a
     // prior offline run may have left.
-    const int dec_ring = cm->hparams.dec_sliding_window;
+    const int dec_ring =
+        (cc->n_ctx > 0 && cc->n_ctx < cm->hparams.dec_sliding_window) ? cc->n_ctx : cm->hparams.dec_sliding_window;
     if (cc->kv_cache.n_ctx < dec_ring) {
         const ggml_type kt = (cc->kv_type == TRANSCRIBE_KV_TYPE_F32) ? GGML_TYPE_F32 : GGML_TYPE_F16;
         cc->kv_cache.free();
